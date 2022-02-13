@@ -1,112 +1,8 @@
 import strutils
 import sets
 import tables
-import std/deques
+import std/[deques, macros, sugar]
 import sequtils
-
-type Program = seq[string]
-type VariableState = tuple[x: int, y: int, z: int, w: int]
-type ProgramState = tuple[ip: int, variables: VariableState]
-
-type ProgramInput = concept t
-  t.haveMore() is bool
-  t.next() is int
-
-
-
-type StringInput = object
-  s: string
-  idx: int
-
-type IntInput = object
-  i: int
-  used: bool
-
-func haveMore(si: StringInput): bool =
-  return si.idx < si.s.len
-
-func next(si: var StringInput): int =
-  let rv = si.s[si.idx].int - '0'.int
-  inc(si.idx)
-  return rv
-
-proc fromString(s: string): StringInput =
-  return StringInput(s: s, idx:0)
-
-func haveMore(ir: IntInput): bool =
-  return not ir.used
-
-func next(ir: var IntInput): int =
-  let rv = ir.i
-  ir.used = true
-  return rv
-
-proc fromInt(i: int): IntInput =
-  return IntInput(i: i)
-
-
-proc executeInstruction(s: string, input: var ProgramInput, variables: var VariableState): bool =
-  proc getVariable(variables: var VariableState, name: string): var int =
-    case name:
-    of "x":
-      return variables.x
-    of "y":
-      return variables.y
-    of "z":
-      return variables.z
-    of "w":
-      return variables.w
-    else:
-      raise newException(Exception, "Unexpected variable name " & name)
-
-  proc getVariableValue(variables: VariableState, name: string): int =
-    case name:
-    of "x":
-      return variables.x
-    of "y":
-      return variables.y
-    of "z":
-      return variables.z
-    of "w":
-      return variables.w
-    else:
-      raise newException(Exception, "Unexpected variable name " & name)
-
-  proc getValue(name: string, variables: VariableState): int =
-    if name in ["x", "y", "z", "w"]:
-      return getVariableValue(variables, name)
-    return name.parseInt
-
-  let parsed = s.split(" ")
-  case parsed[0]:
-  of "inp":
-    if not input.haveMore:
-      return false
-    getVariable(variables, parsed[1]) = input.next
-  of "add":
-    getVariable(variables, parsed[1]) += getValue(parsed[2], variables)
-  of "mul":
-    getVariable(variables, parsed[1]) *= getValue(parsed[2], variables)
-  of "div":
-    getVariable(variables, parsed[1]) = getVariableValue(variables, parsed[1]) div getValue(parsed[2], variables)
-  of "mod":
-    getVariable(variables, parsed[1]) = getVariableValue(variables, parsed[1]) mod getValue(parsed[2], variables)
-  of "eql":
-    getVariable(variables, parsed[1]) = (getVariableValue(variables, parsed[1]) == getValue(parsed[2], variables)).int
-  return true
-
-proc executeProgram(p: Program, input: var ProgramInput, programState: ProgramState): ProgramState =
-  var state = programState
-  while true:
-    if state.ip >= len(p):
-      break
-    let instr = p[state.ip]
-    let executed = executeInstruction(instr, input, state.variables)
-    if not executed:
-      break
-    inc(state.ip)
-
-  return state
 
 func addInFront(n: int64, digit: int8): int64 =
   var n1 = n
@@ -116,31 +12,108 @@ func addInFront(n: int64, digit: int8): int64 =
     d1 *= 10
   return d1 + n
 
+macro compileAll(instructionsSeq: static[seq[seq[string]]]) =
+  echo(instructionsSeq)
+  result = newNimNode(nnkStmtList)
+  for (i, instructions) in instructionsSeq.pairs:
+    var fnDef = newNimNode(nnkFuncDef)
+    fnDef.add(ident("compiled_" & $i)).add(newEmptyNode()).add(newEmptyNode())
+    
+    var formalParams = newNimNode(nnkFormalParams)
+    formalParams.add(ident("int64"))
+    var identDefs = newNimNode(nnkIdentDefs)
+    identDefs.add(ident("w")).add(ident("z")).add(ident("int64")).add(newEmptyNode())
+    formalParams.add(identDefs)
+    fnDef.add(formalParams)
 
-proc acceptableModelNumbers(p: Program, initialState: ProgramState): seq[int64] =
+    fnDef.add(newEmptyNode()).add(newEmptyNode())
+
+    var statements = newNimNode(nnkStmtList)
+    var varSection = newNimNode(nnkVarSection)
+    var varIdentDefs = newNimNode(nnkIdentDefs)
+    # var z1, x, y: int
+    varIdentDefs.add(ident("z1")).add(ident("x")).add(ident("y")).add(ident("int64")).add(newEmptyNode())
+    varSection.add(varIdentDefs)
+    statements.add(varSection)
+    # z1 = z
+    statements.add(newAssignment(ident("z1"), ident("z")))
+
+    var inputW = instructions[0]
+    assert inputW == "inp w"
+    var modifyName = func(varName: string): string =
+      if varName == "z": return "z1"
+      return varName
+    for instr in instructions[1..instructions.high]:
+      let parts = instr.split(" ")
+      let
+        instrType = parts[0]
+        o1 = parts[1]
+        o2 = parts[2]
+      let leftNode = ident(modifyName(o1))
+      let rightNode = (if o2 in ["x", "y", "z", "w"]: ident(modifyName(o2)) else: newIntLitNode(o2.parseInt))
+      case instrType:
+      of "add":
+        statements.add(infix(leftNode, "+=", rightNode))
+      of "mul":
+        statements.add(infix(leftNode, "*=", rightNode))
+      of "div":
+        statements.add(newAssignment(ident(modifyName(o1)), infix(leftNode, "div", rightNode)))
+      of "mod":
+        statements.add(newAssignment(ident(modifyName(o1)), infix(leftNode, "mod", rightNode)))
+      of "eql":
+        statements.add(newAssignment(ident(modifyName(o1)), newDotExpr(newPar(infix(leftNode, "==", rightNode)), ident("int64"))))
+
+    var returnStmt = newNimNode(nnkReturnStmt)
+    returnStmt.add(ident("z1"))
+    statements.add(returnStmt)
+
+    fnDef.add(statements)
+    result.add(fnDef)
+
+  var fnIdents: seq[NimNode]
+  for i in instructionsSeq.low..instructionsSeq.high:
+    fnIdents.add(ident("compiled_" & $i))
+
+  let seqValueNode = newNimNode(nnkPrefix).add(ident("@"), newNimNode(nnkBracket).add(fnIdents))
+  let varSection = newVarStmt(ident("funcs"), seqValueNode)
+  
+  result.add(varSection)
+
+
+proc splitIntoParts(instrs: seq[string]): seq[seq[string]] =
+  var current: seq[string]
+  for s in instrs:
+    if s == "inp w":
+      if current.len > 0:
+        result.add(current)
+      current = @[]
+    current.add(s)
+  result.add(current)
+
+const allInstructions = staticRead("24.input").split("\n").map(x => x.strip).filter(x => not x.isEmptyOrWhitespace).splitIntoParts
+compileAll(allInstructions)
+
+proc acceptableModelNumbers(): seq[int64] =
   var zvals = initHashSet[int]()
   zvals.incl(0)
   var nextZvals = initHashSet[int]()
   var prev = initTable[(int, int), seq[(int8, int)]]()
 
   var lastIp = 0
-  for i in 1..13:
+  for i in 1..14:
     var nextIp = lastIp
     for zv in zvals:
       for digit in 1..9:
-        var input = fromInt(digit)
-        let endState = executeProgram(p, input, (ip: lastIp, variables: (x: 0, y: 0, z: zv, w: 0)))
-        nextZvals.incl(endState.variables.z)
-        prev.mgetOrPut((endState.variables.z, i), @[]).add((digit.int8, zv))
-        nextIp = endState.ip
+        let newZ = funcs[i-1](digit, zv).int
+        nextZvals.incl(newZ)
+        prev.mgetOrPut((newZ, i), @[]).add((digit.int8, zv))
     zvals = nextZvals
     nextZvals = initHashSet[int]()
     lastIp = nextIp
-  # Pre-computed but oh well
-  let lastDigitInputAndZ: seq[(int64, int)] = @[(4.int64, 15), (3.int64, 14), (6.int64, 17), (2.int64, 13), (5.int64, 16), (7.int64, 18), (8.int64, 19), (1.int64, 12)]
+  let lastDigitInputAndZ = prev[(0, 14)]
   var queue = initDeque[(int64, int, int)]()
   for (i, z) in lastDigitInputAndZ:
-    queue.addLast((i, z, 13))
+    queue.addLast((i.int64, z, 13))
 
   var numbers: seq[int64] = @[]
   while len(queue) > 0:
@@ -154,20 +127,14 @@ proc acceptableModelNumbers(p: Program, initialState: ProgramState): seq[int64] 
   return numbers
 
 
-proc readProgram(): Program =
-  for line in stdin.lines:
-    result.add(line)
-
-let program = readProgram()
-let initialState = (ip: 0, variables: (x: 0, y: 0, z: 0, w:0))
-let modelNumbers = acceptableModelNumbers(program, initialState)
-
 proc partOne() =
+  let modelNumbers = acceptableModelNumbers()
   let result = modelNumbers[modelNumbers.maxIndex]
   echo(result)
 
 proc partTwo() =
+  let modelNumbers = acceptableModelNumbers()
   let result = modelNumbers[modelNumbers.minIndex]
   echo(result)
 
-partTwo()
+partOne()
